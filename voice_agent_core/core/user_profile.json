@@ -1,0 +1,33 @@
+{
+    "location": "Bhubaneswar",
+    "interests": [
+        "cricket",
+        "football",
+        "technology",
+        "weather",
+        "security"
+    ],
+    "ignore_list": [
+        "network_change",
+        "weather_cold"
+    ],
+    "severity_threshold": "medium",
+    "priority_levels": {
+        "cpu_spike": "high",
+        "ram_spike": "high",
+        "disk_full": "medium",
+        "low_battery": "critical",
+        "new_device": "high",
+        "network_change": "low",
+        "weather_rain": "medium",
+        "weather_rain_forecast": "low",
+        "weather_heat": "medium",
+        "weather_cold": "low",
+        "weather_temp_spike": "medium",
+        "cricket_major": "high",
+        "football_major": "medium",
+        "news_breaking": "high"
+    },
+    "context_boost_enabled": true,
+    "grouping_window_seconds": 15
+}

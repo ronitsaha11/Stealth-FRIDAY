@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.raptor.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/soumyadebtripathy/Stealth F.R.I.D.A.Y/voice_agent_core/core/launch_raptor.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardErrorPath</key>
+    <string>/Users/soumyadebtripathy/Stealth F.R.I.D.A.Y/voice_agent_core/raptor_launcher.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/soumyadebtripathy/Stealth F.R.I.D.A.Y/voice_agent_core/raptor_launcher.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/soumyadebtripathy/Stealth F.R.I.D.A.Y/voice_agent_core</string>
+</dict>
+</plist>

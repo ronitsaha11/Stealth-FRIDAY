@@ -1,0 +1,407 @@
+"""
+Core – Voice Agent (MCP-powered)
+===================================
+AI voice assistant that controls RGB lighting, runs diagnostics,
+scans the network, and triggers boot sequences via an MCP server.
+
+Run:
+  uv run core.agent dev      – LiveKit Cloud mode
+  uv run core.agent console  – text-only console mode
+"""
+
+import os
+import logging
+import subprocess
+import asyncio
+import threading
+from typing import Any, AsyncIterable, Coroutine
+
+from dotenv import load_dotenv
+load_dotenv()
+from livekit.agents import JobContext, WorkerOptions, cli
+from livekit.agents.voice import Agent, AgentSession, ModelSettings
+from livekit.agents.llm import mcp
+from livekit.agents import llm
+
+# Plugins
+from livekit.plugins import google as lk_google, openai as lk_openai, sarvam, silero, groq
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+STT_PROVIDER       = "sarvam"
+LLM_PROVIDER       = "groq"
+TTS_PROVIDER       = "sarvam"
+
+GEMINI_LLM_MODEL   = "gemini-2.0-flash"
+OPENAI_LLM_MODEL   = "gpt-4o"
+GROQ_LLM_MODEL     = "llama-3.1-8b-instant"
+
+OPENAI_TTS_MODEL   = "tts-1"
+OPENAI_TTS_VOICE   = "nova"
+TTS_SPEED           = 1.15
+
+SARVAM_TTS_LANGUAGE = "en-IN"
+SARVAM_TTS_SPEAKER  = "rahul"
+
+MCP_SERVER_PORT = 8000
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = (
+    "You are F.R.I.D.A.Y, a highly capable AI voice assistant.\n"
+    "You can control apps, search files, fetch news, and execute system commands.\n"
+    "If a task requires multiple steps, break it into a sequence of tool calls and execute them in order.\n"
+    "Always prioritize action over explanation.\n"
+    "Keep responses concise and spoken-word friendly."
+)
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("core-agent")
+logger.setLevel(logging.DEBUG)
+
+
+# ---------------------------------------------------------------------------
+# Resolve Windows host IP from WSL
+# ---------------------------------------------------------------------------
+
+def _get_windows_host_ip() -> str:
+    try:
+        cmd = "ip route show default | awk '{print $3}'"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
+        ip = result.stdout.strip()
+        if ip:
+            return ip
+    except Exception:
+        pass
+    try:
+        with open("/etc/resolv.conf", "r") as f:
+            for line in f:
+                if "nameserver" in line:
+                    return line.split()[1]
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def _mcp_server_url() -> str:
+    url = f"http://127.0.0.1:{MCP_SERVER_PORT}/sse"
+    logger.info("MCP Server URL: %s", url)
+    return url
+
+
+# ---------------------------------------------------------------------------
+# Build provider instances
+# ---------------------------------------------------------------------------
+
+def _build_stt():
+    if STT_PROVIDER == "sarvam":
+        logger.info("STT → Sarvam Saaras v3")
+        return sarvam.STT(
+            language="unknown", model="saaras:v3",
+            mode="transcribe", flush_signal=True, sample_rate=16000,
+        )
+    elif STT_PROVIDER == "whisper":
+        logger.info("STT → OpenAI Whisper")
+        return lk_openai.STT(model="whisper-1")
+    else:
+        raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
+
+
+def _build_llm():
+    if LLM_PROVIDER == "openai":
+        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
+        return lk_openai.LLM(model=OPENAI_LLM_MODEL)
+    elif LLM_PROVIDER == "gemini":
+        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
+        return lk_google.LLM(model=GEMINI_LLM_MODEL, api_key=os.getenv("GOOGLE_API_KEY"))
+    elif LLM_PROVIDER == "groq":
+        logger.info("LLM → Groq (%s)", GROQ_LLM_MODEL)
+        return groq.LLM(model=GROQ_LLM_MODEL)
+    else:
+        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
+
+
+def _build_tts():
+    if TTS_PROVIDER == "sarvam":
+        logger.info("TTS → Sarvam Bulbul v3")
+        return sarvam.TTS(
+            target_language_code=SARVAM_TTS_LANGUAGE,
+            model="bulbul:v3", speaker=SARVAM_TTS_SPEAKER, pace=TTS_SPEED,
+        )
+    elif TTS_PROVIDER == "openai":
+        logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
+        return lk_openai.TTS(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, speed=TTS_SPEED)
+    else:
+        raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+class CoreAgent(Agent):
+    """
+    Core AI voice assistant with wake-word activation.
+    All tools are provided via the MCP server.
+    """
+
+    def __init__(self, stt, llm, tts) -> None:
+        super().__init__(
+            instructions=SYSTEM_PROMPT,
+            stt=stt, llm=llm, tts=tts,
+            vad=silero.VAD.load(),
+            mcp_servers=[
+                mcp.MCPServerHTTP(
+                    url=_mcp_server_url(),
+                    transport_type="sse",
+                    client_session_timeout_seconds=30,
+                ),
+            ],
+        )
+        self._is_awake = False
+        self._session_ref: AgentSession | None = None
+        # This event bridges the background thread → asyncio loop safely
+        self._wake_event = asyncio.Event()
+
+    def set_session(self, session: AgentSession) -> None:
+        """Store a reference to the AgentSession so we can call say()."""
+        self._session_ref = session
+        print("[PIPELINE] Session reference stored on agent")
+
+    # ------------------------------------------------------------------
+    # WAKE WORD BRIDGE (thread-safe)
+    # ------------------------------------------------------------------
+
+    def _fire_wake_event(self):
+        """
+        Called from the background wake-listener thread via
+        loop.call_soon_threadsafe(). Sets the asyncio Event so the
+        watcher coroutine (running on the event loop) can proceed.
+        """
+        if not self._is_awake:
+            self._is_awake = True
+            self._wake_event.set()
+            print("=" * 60)
+            print("[WAKE] WAKE ACTIVATED — _is_awake = True")
+            print("=" * 60)
+
+    # ------------------------------------------------------------------
+    # ACTIVATE — delivers TTS greeting (runs on event loop)
+    # ------------------------------------------------------------------
+
+    async def activate(self):
+        """Deliver the greeting. Only runs after session.start() is live."""
+        print("[ACTIVATE] CALLED — delivering greeting")
+
+        if self._session_ref is None:
+            print("[ACTIVATE] CRITICAL: No session reference!")
+            return
+
+        try:
+            print("[ACTIVATE] Sending to TTS: 'Hello, how can I assist you?'")
+            await self._session_ref.say("Hello, how can I assist you?")
+            print("[ACTIVATE] ✅ GREETING SENT — audio should play")
+        except Exception as e:
+            print(f"[ACTIVATE] say() FAILED: {e}")
+            try:
+                print("[ACTIVATE] Fallback: generate_reply")
+                await self._session_ref.generate_reply(
+                    instructions="Say exactly: Hello, how can I assist you?"
+                )
+                print("[ACTIVATE] ✅ Fallback greeting sent")
+            except Exception as e2:
+                print(f"[ACTIVATE] Fallback also FAILED: {e2}")
+
+    # ------------------------------------------------------------------
+    # ON_ENTER — runs AFTER session.start() connects
+    # ------------------------------------------------------------------
+
+    async def on_enter(self) -> None:
+        """
+        Called by LiveKit AFTER the session is fully started.
+        1. Test TTS directly
+        2. Start the wake-word watcher coroutine
+        """
+        print("[PIPELINE] on_enter() — session is LIVE")
+
+        # --- STEP 1: Force TTS test to verify audio output works ---
+        # Add a delay so WebRTC and TURN connections have time to stabilize
+        async def _test_tts():
+            await asyncio.sleep(1.5)
+            if self._session_ref is not None:
+                try:
+                    print("[PIPELINE] TTS TEST: Sending 'F.R.I.D.A.Y online'")
+                    await self._session_ref.say("F.R.I.D.A.Y online. Waiting for wake word.")
+                    print("[PIPELINE] ✅ TTS TEST PASSED — audio should have played")
+                except Exception as e:
+                    print(f"[PIPELINE] ❌ TTS TEST FAILED: {e}")
+        
+        asyncio.ensure_future(_test_tts())
+
+        # --- STEP 2: Launch wake watcher coroutine ---
+        print("[PIPELINE] Launching wake watcher coroutine")
+        asyncio.ensure_future(self._wake_watcher())
+
+    async def _wake_watcher(self):
+        """Blocks until the wake event is set, then calls activate()."""
+        print("[PIPELINE] Wake watcher running — waiting for 'hey jarvis'...")
+        await self._wake_event.wait()
+        print("[PIPELINE] Wake event received! Calling activate()...")
+        await self.activate()
+
+    # ------------------------------------------------------------------
+    # LLM NODE OVERRIDE — blocks ALL LLM calls while asleep
+    # ------------------------------------------------------------------
+
+    async def _empty_stream(self):
+        """Yields nothing — used to skip LLM when asleep."""
+        return
+        yield  # makes this an async generator
+
+    def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        model_settings: ModelSettings,
+    ):
+        """
+        Override the LLM node to completely skip API calls while asleep.
+        This prevents rate-limit exhaustion from ambient noise.
+        """
+        if not self._is_awake:
+            print("[SLEEP] LLM NODE BLOCKED — agent is sleeping, no API call made")
+            return self._empty_stream()
+
+        # Awake — use default LLM pipeline
+        print("[PIPELINE] LLM NODE — calling Groq API")
+        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+
+    # ------------------------------------------------------------------
+    # USER TURN HANDLER
+    # ------------------------------------------------------------------
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """
+        Called by LiveKit BEFORE the LLM is invoked for this turn.
+        """
+        user_text = new_message.content if hasattr(new_message, 'content') else str(new_message)
+        print(f"[PIPELINE] USER INPUT RECEIVED: '{user_text}'")
+
+        # --- If not awake, drop the input ---
+        if not self._is_awake:
+            print(f"[SLEEP] IGNORED (agent sleeping): '{user_text[:60]}'")
+            new_message.content = ""
+            return
+
+        # --- AWAKE: process input ---
+        if not user_text or not user_text.strip():
+            print("[PIPELINE] Empty input after wake, skipping")
+            return
+
+        print(f"[PIPELINE] PROCESSING: '{user_text}'")
+
+        # Multi-step planner check
+        from core.planner import plan_task
+        from core.executor import execute_plan
+
+        plan = plan_task(user_text)
+        if plan and len(plan) > 1:
+            print(f"[PIPELINE] Multi-step plan: {plan}")
+            results = execute_plan(plan)
+            results_str = "\n".join([
+                f"{r['tool']}: {r['status']} - {r.get('result', r.get('error', ''))}"
+                for r in results
+            ])
+            new_message.content = (
+                f"The user asked: '{user_text}'.\n"
+                f"I executed these tools and got:\n{results_str}\n\n"
+                f"Summarize what was accomplished for the user."
+            )
+            print("[PIPELINE] Plan results injected for LLM")
+        else:
+            print("[PIPELINE] SENDING TO LLM → single-step / MCP pipeline")
+
+        print("[PIPELINE] Handing off to LLM → TTS")
+
+
+# ---------------------------------------------------------------------------
+# LiveKit entry point
+# ---------------------------------------------------------------------------
+
+def _turn_detection() -> str:
+    return "stt" if STT_PROVIDER == "sarvam" else "vad"
+
+
+def _endpointing_delay() -> float:
+    return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    print(f"[BOOT] Core online – room: {ctx.room.name} | STT={STT_PROVIDER} | LLM={LLM_PROVIDER} | TTS={TTS_PROVIDER}")
+
+    stt = _build_stt()
+    llm = _build_llm()
+    tts = _build_tts()
+
+    agent = CoreAgent(stt=stt, llm=llm, tts=tts)
+
+    session = AgentSession(
+        turn_detection=_turn_detection(),
+        min_endpointing_delay=_endpointing_delay(),
+    )
+
+    # Give the agent a reference to the session
+    agent.set_session(session)
+
+    # --- CRITICAL: Get the running event loop for thread-safe bridging ---
+    loop = asyncio.get_running_loop()
+
+    # --- Start wake-word listener on a background thread ---
+    from core.wake_listener import start_wake_listener
+
+    def _on_wake():
+        """Called from the wake-listener thread. Bridges to asyncio loop."""
+        print("[WAKE] Wake word detected in listener thread!")
+        print("[WAKE] Scheduling _fire_wake_event() on event loop...")
+        loop.call_soon_threadsafe(agent._fire_wake_event)
+
+    wake_thread = threading.Thread(
+        target=start_wake_listener,
+        args=(_on_wake,),
+        daemon=True,
+    )
+    wake_thread.start()
+    print("[BOOT] Wake listener thread started")
+
+    # --- Start the session (blocks until session ends) ---
+    # on_enter() fires after this connects → TTS test + wake watcher launch
+    print("[BOOT] Starting LiveKit session...")
+    await session.start(
+        agent=agent,
+        room=ctx.room,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+
+def dev():
+    """Wrapper to run the agent in dev mode automatically."""
+    import sys
+    if len(sys.argv) == 1:
+        sys.argv.append("dev")
+    main()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+[
+  {
+    "event_type": "weather_heat",
+    "response": "cancelled",
+    "timestamp": "2026-04-22T14:48:59.868827",
+    "hour": 14,
+    "period": "afternoon"
+  },
+  {
+    "event_type": "weather_rain",
+    "response": "cancelled",
+    "timestamp": "2026-04-30T22:38:16.301159",
+    "hour": 22,
+    "period": "evening"
+  }
+]

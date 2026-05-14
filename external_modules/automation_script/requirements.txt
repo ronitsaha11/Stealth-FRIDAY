@@ -1,0 +1,24 @@
+# URL Opener with IP Rotation - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Selenium WebDriver for browser automation
+selenium>=4.0.0
+
+# HTTP requests library with SOCKS proxy support
+requests>=2.28.0
+requests[socks]>=2.28.0
+
+# SOCKS proxy support for Python requests
+PySocks>=1.7.1
+
+# Tor controller library for IP rotation
+stem>=1.8.0
+
+# Optional: WebDriver Manager for automatic driver management
+webdriver-manager>=3.8.0
+
+# Optional: Fake User-Agent for better stealth
+fake-useragent>=1.1.0
+
+# System Information Script Dependencies
+psutil>=5.9.0  # System and process utilities

@@ -1,0 +1,53 @@
+# ─── Python ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Virtual Environment ──────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Environment & Secrets ────────────────────────────
+.env
+.env.local
+token.json
+credentials.json
+*.pem
+*.key
+
+# ─── Logs ─────────────────────────────────────────────
+logs/
+*.log
+
+# ─── IDE & Editor ─────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── macOS ────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─── Cache & Build ────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.next/
+node_modules/
+
+# ─── Data Files (generated at runtime) ────────────────
+core/user_profile.json
+core/interaction_log.json
+
+# ─── Backup Files ─────────────────────────────────────
+*.backup
+*.bak
